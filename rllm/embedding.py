@@ -113,3 +113,133 @@ class PositionalEncoding(nn.Module):
 
         # 4) 드롭아웃 적용 후 반환
         return self.dropout(x)
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """
+    텐서의 절반을 회전시킵니다.
+    마지막 차원을 반으로 나누어 앞/뒤 부분을 바꿔줍니다.
+    
+    Args:
+        x: 입력 텐서, 마지막 차원이 회전 대상
+        
+    Returns:
+        회전된 텐서 (원본과 동일한 형태)
+    """
+    # 입력 텐서의 마지막 차원을 반으로 나눔
+    x1 = x[..., : x.shape[-1] // 2]  # 앞쪽 절반
+    x2 = x[..., x.shape[-1] // 2 :]  # 뒤쪽 절반
+    
+    # x2를 음수로 바꾸고 x1과 순서 바꿔서 다시 이어붙임
+    return torch.cat((-x2, x1), dim=-1)
+
+
+class RotaryPositionEmbedding(nn.Module):
+    """
+    ▷ Rotary Position Embedding (RoPE) 구현
+       - LLaMA, GPT-NeoX 등 최신 모델에서 사용하는 위치 인코딩 방식
+       - 토큰 위치에 따라 임베딩 벡터를 회전시켜 상대적 위치 정보를 반영
+       - 장점: 토큰 간 상대적 위치 관계를 더 잘 학습하고, 더 긴 시퀀스로 확장 가능
+    """
+    def __init__(self, 
+                 d_model: int, 
+                 max_length: int = 5000,
+                 base: int = 10000):
+        """
+        Args:
+            d_model: 모델 차원 (반드시 짝수여야 함)
+            max_length: 지원할 최대 시퀀스 길이
+            base: 회전 주기 계산에 사용하는 기본값 (일반적으로 10000)
+        """
+        super(RotaryPositionEmbedding, self).__init__()
+        
+        # d_model이 짝수인지 확인
+        assert d_model % 2 == 0, "d_model은 RoPE에서 반드시 짝수여야 합니다."
+        self.d_model = d_model
+        self.max_length = max_length
+        
+        # 회전에 사용할 프리컴퓨팅된 코사인과 사인 값 생성
+        # 각 위치와 주파수 쌍에 대한 cos, sin 값 계산
+        # shape: [max_length, d_model/2]
+        self._precompute_freqs(d_model, max_length, base)
+        
+    def _precompute_freqs(self, dim: int, max_length: int, base: int = 10000):
+        """
+        위치 인코딩에 사용할 주파수 테이블을 미리 계산합니다.
+        
+        Args:
+            dim: 모델 차원 (RoPE는 dim/2 크기의 sin/cos 쌍 사용)
+            max_length: 최대 시퀀스 길이
+            base: 스케일링 베이스 (일반적으로 10000)
+        """
+        # 차원 인덱스에 따른 주파수: (d_model/2,)
+        # 각 쌍별 다른 주파수 사용
+        freqs = torch.arange(0, dim, 2).float() / dim
+        inv_freq = base ** -freqs  # (dim/2,)
+        
+        # 위치 인덱스: (max_length,)
+        seq_idx = torch.arange(max_length).float()
+        
+        # 외적: (max_length, dim/2)
+        sinusoid_inp = torch.outer(seq_idx, inv_freq)
+        
+        # sin, cos 계산: (max_length, dim/2)
+        sin = torch.sin(sinusoid_inp)
+        cos = torch.cos(sinusoid_inp)
+        
+        # 모델 생애 주기 동안 고정된 값 (학습되지 않음)
+        self.register_buffer("sin", sin)
+        self.register_buffer("cos", cos)
+        
+    def apply_rotary_pos_emb(self, q: torch.Tensor, k: torch.Tensor, position_ids: torch.Tensor = None, unsqueeze_dim: int = 1):
+        """
+        쿼리와 키 텐서에 회전 위치 인코딩을 적용합니다.
+        
+        Args:
+            q: (batch_size, ..., seq_len, d_model) 형태의 쿼리 텐서
+            k: (batch_size, ..., seq_len, d_model) 형태의 키 텐서
+            position_ids: 위치 ID 텐서. None이면 0부터 seq_len-1까지의 인덱스 사용
+            unsqueeze_dim: sin/cos를 unsqueeze할 차원 (어텐션 헤드 차원)
+            
+        Returns:
+            회전 인코딩이 적용된 (q, k) 쌍
+        """
+        seq_len = q.size(-2)
+        
+        # position_ids가 없으면 0부터 seq_len-1까지의 인덱스 생성
+        if position_ids is None:
+            position_ids = torch.arange(0, seq_len, device=q.device).unsqueeze(0)
+        
+        # 필요한 위치의 sin, cos 값만 가져오기
+        sin = self.sin[position_ids]  # (batch_size, seq_len, dim/2)
+        cos = self.cos[position_ids]  # (batch_size, seq_len, dim/2)
+        
+        # 차원에 따라 브로드캐스팅 가능하도록 unsqueeze
+        sin = sin.unsqueeze(unsqueeze_dim)
+        cos = cos.unsqueeze(unsqueeze_dim)
+        
+        # q, k에 회전 적용
+        q_embed = (q * cos) + (rotate_half(q) * sin)
+        k_embed = (k * cos) + (rotate_half(k) * sin)
+        
+        # 원본 텐서와 동일한 dtype 유지
+        return q_embed.type_as(q), k_embed.type_as(k)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        RoPE는 일반적으로 어텐션 계층에서 q, k에 직접 적용됩니다.
+        이 메서드는 이전 PositionalEncoding과의 호환성을 위해 제공되지만,
+        실제로는 어텐션 계층에서 apply_rotary_pos_emb 메서드를 직접 호출해야 합니다.
+        
+        Args:
+            x: (batch_size, seq_len, d_model) 형태의 입력 텐서
+            
+        Returns:
+            동일한 형태의 출력 텐서 (호환성을 위해 그대로 반환)
+        """
+        # 호환성을 위해 입력을 그대로 전달
+        # 실제 RoPE는 MultiHeadAttention 내부에서 쿼리와 키에 적용됨
+        return x
+        
+    def __repr__(self):
+        return f"RotaryPositionEmbedding(d_model={self.d_model}, max_length={self.max_length})"
